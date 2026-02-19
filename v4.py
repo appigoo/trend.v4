@@ -6,20 +6,20 @@ from plotly.subplots import make_subplots
 import time
 
 # --- 頁面配置 ---
-st.set_page_config(page_title="VIX聯動-多股監控系統", layout="wide")
-st.title("🚀 多股趨勢監控 (VIX 情緒聯動版)")
+st.set_page_config(page_title="專業級多股實時監控", layout="wide")
+st.title("🚀 專業實時趨勢監控 (含 VIX 與 RSI 多重預警)")
 
 # --- 側邊欄 ---
-st.sidebar.header("監控設定")
-default_symbols = "AAPL, TSLA, NVDA, 2330.TW"
-input_symbols = st.sidebar.text_input("輸入股票代碼 (逗號分隔)", default_symbols)
+st.sidebar.header("核心設定")
+default_symbols = "AAPL, NVDA, TSLA, 2330.TW, ^VIX"
+input_symbols = st.sidebar.text_input("監控列表 (逗號分隔)", "AAPL, NVDA, TSLA, QQQ")
 symbols = [s.strip().upper() for s in input_symbols.split(",")]
 
 interval = st.sidebar.selectbox("資料頻率", ("1m", "2m", "5m"), index=0)
-ema_fast = st.sidebar.slider("快速 EMA", 5, 20, 9)
-ema_slow = st.sidebar.slider("慢速 EMA", 21, 50, 21)
+ema_fast_val = st.sidebar.slider("快速 EMA", 5, 20, 9)
+ema_slow_val = st.sidebar.slider("慢速 EMA", 21, 50, 21)
 
-# --- 核心函數 ---
+# --- 核心運算函數 ---
 def fetch_data(ticker, interval):
     try:
         data = yf.download(ticker, period="1d", interval=interval, progress=False)
@@ -30,113 +30,148 @@ def fetch_data(ticker, interval):
     except:
         return None
 
-def get_vix_data():
-    """抓取 VIX 數據並判斷恐慌程度"""
-    vix = fetch_data("^VIX", "2m")
-    if vix is None or len(vix) < 2: return 20.0, 0.0, "穩定"
-    curr_v = float(vix['Close'].iloc[-1])
-    prev_v = float(vix['Close'].iloc[-2])
-    v_change = curr_v - prev_v
-    
-    if curr_v > 25: status = "😨 恐慌"
-    elif curr_v < 15: status = "😊 樂觀"
-    else: status = "😐 中性"
-    return curr_v, v_change, status
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def analyze_trend(df, vix_change):
-    if df is None or len(df) < ema_slow:
-        return None, "數據不足", "等待", None, False
+def get_vix_info():
+    vix = fetch_data("^VIX", "2m")
+    if vix is None or len(vix) < 2: return 20.0, 0.0
+    return float(vix['Close'].iloc[-1]), float(vix['Close'].iloc[-1] - vix['Close'].iloc[-2])
+
+def analyze_stock(df, vix_chg):
+    if df is None or len(df) < 25:
+        return None, {}
     
-    # 指標計算
-    df['EMA_Fast'] = df['Close'].ewm(span=ema_fast, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=ema_slow, adjust=False).mean()
+    # 計算指標
+    df['EMA_F'] = df['Close'].ewm(span=ema_fast_val, adjust=False).mean()
+    df['EMA_S'] = df['Close'].ewm(span=ema_slow_val, adjust=False).mean()
+    df['RSI'] = calculate_rsi(df['Close'])
     df['Vol_MA'] = df['Volume'].rolling(window=10).mean()
     
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    curr_fast, curr_slow = float(last['EMA_Fast']), float(last['EMA_Slow'])
-    prev_fast, prev_slow = float(prev['EMA_Fast']), float(prev['EMA_Slow'])
     
-    # 趨勢與反轉邏輯
-    signal = "持平"
-    alert = None
-    vol_spike = float(last['Volume']) > (float(last['Vol_MA']) * 1.8)
+    # 數值提取
+    curr_p = float(last['Close'])
+    prev_p = float(prev['Close'])
+    p_chg_pct = ((curr_p - prev_p) / prev_p) * 100
+    curr_rsi = float(last['RSI'])
+    vol_ratio = float(last['Volume'] / last['Vol_MA'])
     
-    if prev_fast <= prev_slow and curr_fast > curr_slow:
-        signal = "↗️ 向上反轉"
-        alert = "黃金交叉"
-        if vix_change < 0: alert += " (VIX下降配合)"
-    elif prev_fast >= prev_slow and curr_fast < curr_slow:
-        signal = "↘️ 向下反轉"
-        alert = "死亡交叉"
-        if vix_change > 0: alert += " (注意:VIX同步上升!)"
+    # 訊號判斷
+    signal = "穩定"
+    alert_level = "success" # success, warning, error
     
-    trend = "多頭 (Bullish)" if curr_fast > curr_slow else "空頭 (Bearish)"
-    return df, trend, signal, alert, vol_spike
+    # 趨勢反轉邏輯
+    is_gold = prev['EMA_F'] <= prev['EMA_S'] and last['EMA_F'] > last['EMA_S']
+    is_death = prev['EMA_F'] >= prev['EMA_S'] and last['EMA_F'] < last['EMA_S']
+    
+    msg = ""
+    if is_gold:
+        msg = "🚀 黃金交叉"
+        alert_level = "error" if vix_chg < 0 else "warning"
+    elif is_death:
+        msg = "💀 死亡交叉"
+        alert_level = "error"
+    elif curr_rsi > 75:
+        msg = "⚠️ RSI 超買"
+        alert_level = "warning"
+    elif curr_rsi < 25:
+        msg = "📉 RSI 超賣"
+        alert_level = "warning"
+    
+    # 量能
+    vol_msg = "🔥 爆量" if vol_ratio > 2.0 else "正常"
+    
+    info = {
+        "price": curr_p,
+        "pct": p_chg_pct,
+        "rsi": curr_rsi,
+        "vol_ratio": vol_ratio,
+        "trend": "多頭" if last['EMA_F'] > last['EMA_S'] else "空頭",
+        "msg": msg,
+        "alert_level": alert_level,
+        "vol_msg": vol_msg
+    }
+    return df, info
 
 # --- 主體介面 ---
 placeholder = st.empty()
 
 while True:
     with placeholder.container():
-        # 1. VIX 全局看板
-        v_val, v_chg, v_status = get_vix_data()
+        # 1. VIX 全局風險提示
+        vix_val, vix_chg = get_vix_info()
         v_col1, v_col2 = st.columns([1, 4])
-        with v_col1:
-            st.metric("VIX 恐慌指數", f"{v_val:.2f}", f"{v_chg:.2f}", delta_color="inverse")
+        v_col1.metric("VIX 指數", f"{vix_val:.2f}", f"{v_chg:.2f}", delta_color="inverse")
         with v_col2:
-            st.info(f"**市場當前情緒:** {v_status} | **對策:** {'避險為主' if v_val > 25 else '順勢操作'}")
+            if vix_chg > 0.5:
+                st.error(f"🚨 市場恐慌升溫中！當前 VIX 變動: +{v_chg:.2f}。建議縮減個股多單。")
+            else:
+                st.info("✅ 市場情緒相對穩定，技術面訊號參考價值高。")
 
-        # 2. 即時警報摘要 (UI 保持你喜歡的風格)
+        # 2. 即時警報摘要 (強化版內容)
         st.subheader("🔔 即時警報摘要")
         alert_cols = st.columns(len(symbols))
         
-        # 儲存分析結果以便下方繪圖使用，避免重複抓取
-        results = {}
+        stock_results = {}
 
         for idx, sym in enumerate(symbols):
             df_raw = fetch_data(sym, interval)
-            df, trend, signal, alert, vol_spike = analyze_trend(df_raw, v_chg)
-            results[sym] = (df, trend, signal, alert, vol_spike)
+            df, info = analyze_stock(df_raw, vix_chg)
+            stock_results[sym] = (df, info)
             
             with alert_cols[idx]:
-                if alert:
-                    # 如果 VIX 也在漲，警報顏色更深（error），否則用 warning
-                    st.error(f"**{sym}**\n\n{alert}!") if v_chg > 0 else st.warning(f"**{sym}**\n\n{alert}!")
-                elif vol_spike:
-                    st.warning(f"**{sym}**\n\n量能異常!")
+                if info:
+                    # 根據警報等級顯示顏色
+                    if info['alert_level'] == "error":
+                        st.error(f"**{sym} | {info['msg']}**")
+                    elif info['alert_level'] == "warning":
+                        st.warning(f"**{sym} | {info['msg']}**")
+                    else:
+                        st.success(f"**{sym} | 趨勢{info['trend']}**")
+                    
+                    # 摘要內容填充
+                    st.caption(f"價格: {info['price']:.2f} ({info['pct']:+.2f}%)")
+                    st.caption(f"RSI: {info['rsi']:.1f} | 量比: {info['vol_ratio']:.1f}x")
+                    if info['vol_ratio'] > 2:
+                        st.markdown(f"<span style='color:red; font-size:12px;'>{info['vol_msg']}偵測</span>", unsafe_allow_html=True)
                 else:
-                    st.success(f"**{sym}**\n\n趨勢穩定")
+                    st.write(f"{sym}\n載入中...")
 
         st.divider()
-        st.subheader("📈 詳細走勢分析")
+        st.subheader("📈 詳細技術走勢")
 
         for sym in symbols:
-            df, trend, signal, alert, vol_spike = results[sym]
-            with st.expander(f"查看 {sym} 詳情 - {trend} | {signal}", expanded=True):
-                if df is not None:
-                    col_info, col_chart = st.columns([1, 3])
-                    with col_info:
-                        curr_p = df['Close'].iloc[-1]
-                        diff = curr_p - df['Close'].iloc[-2]
-                        st.metric("當前價格", f"{curr_p:.2f}", f"{diff:.2f}")
-                        st.write(f"**量能:** {'🔥 爆量' if vol_spike else '正常'}")
-                        if alert: st.write(f"**訊號:** {alert}")
+            df, info = stock_results[sym]
+            if df is not None:
+                with st.expander(f"查看 {sym} 詳情分析表", expanded=True):
+                    c_left, c_right = st.columns([1, 4])
+                    with c_left:
+                        st.write(f"**核心數據**")
+                        st.write(f"趨勢: `{info['trend']}`")
+                        st.write(f"RSI(14): `{info['rsi']:.2f}`")
+                        st.write(f"成交量比: `{info['vol_ratio']:.2f}x`平衡")
+                        if vix_chg > 0 and info['trend'] == "空頭":
+                            st.write("🆘 **聯動警告: VIX與股價同步看跌**")
                     
-                    with col_chart:
-                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], name="Fast", line=dict(color='orange', width=1)), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], name="Slow", line=dict(color='cyan', width=1)), row=1, col=1)
+                    with c_right:
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.03)
+                        # K線
+                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_F'], name="EMA快", line=dict(color='orange', width=1.5)), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_S'], name="EMA慢", line=dict(color='cyan', width=1.5)), row=1, col=1)
                         
-                        # 成交量變色邏輯
-                        v_colors = ['#ef5350' if df['Close'].iloc[i] < df['Open'].iloc[i] else '#26a69a' for i in range(len(df))]
-                        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=v_colors, name="成交量"), row=2, col=1)
+                        # 成交量
+                        v_colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' for i in range(len(df))]
+                        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=v_colors), row=2, col=1)
                         
-                        fig.update_layout(height=380, margin=dict(t=20, b=0), xaxis_rangeslider_visible=False, showlegend=False)
+                        fig.update_layout(height=400, margin=dict(t=0, b=0), xaxis_rangeslider_visible=False, showlegend=False)
                         st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.error(f"{sym} 獲取失敗")
 
         time.sleep(60)
         st.rerun()
